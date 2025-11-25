@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "OmniChat Traffic Analyzer",
+  "version": "3.0.0",
+  "description": "Анализатор трафика OmniChat - улучшенный перехват и автоответчик",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "clipboardWrite",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://omnichat.rt.ru/*",
+    "*://*.omnichat.rt.ru/*",
+    "*://*.rt.ru/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "OmniChat Traffic Analyzer",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://omnichat.rt.ru/*",
+        "*://*.omnichat.rt.ru/*"
+      ],
+      "js": ["content.js", "omniChatAppelMonitor.js", "test-helper.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["*://omnichat.rt.ru/*", "*://*.omnichat.rt.ru/*"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

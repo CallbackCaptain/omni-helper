@@ -13,7 +13,7 @@ class OmniChatAutoResponder {
         this.config = {
             responseDelay: 2000,
             clickDelay: 500,
-            checkInterval: 20000,      // Check for new appeals every 20 seconds
+            checkInterval: 2000,       // Check for new appeals every 2 seconds (optimized from 20s)
             cooldownPeriod: 2 * 60 * 60 * 1000,  // 2 hours cooldown
             templateText: 'Запрос принят в работу',
             templateTitle: '1.1 Приветствие'
@@ -29,9 +29,9 @@ class OmniChatAutoResponder {
         this.setupObserver();
         this.startPeriodicCheck();
         this.exposeAPI();
-        
-        // Initial check after page load
-        setTimeout(() => this.checkForAppeals(), 3000);
+
+        // Initial check after page load (optimized from 3000ms)
+        setTimeout(() => this.checkForAppeals(), 500);
     }
 
     // ===== STATE MANAGEMENT =====
@@ -272,9 +272,9 @@ class OmniChatAutoResponder {
     
     setupObserver() {
         const observer = new MutationObserver(() => {
-            // Debounce checks
+            // Debounce checks (optimized from 1000ms)
             clearTimeout(this.checkTimeout);
-            this.checkTimeout = setTimeout(() => this.checkForAppeals(), 1000);
+            this.checkTimeout = setTimeout(() => this.checkForAppeals(), 300);
         });
         
         // Observe sidebar for new appeals
@@ -284,7 +284,7 @@ class OmniChatAutoResponder {
                 observer.observe(sidebar, { childList: true, subtree: true });
                 console.log('👁️ Observing sidebar');
             } else {
-                setTimeout(observeTarget, 2000);
+                setTimeout(observeTarget, 500);  // Optimized from 2000ms
             }
         };
         
@@ -326,7 +326,7 @@ class OmniChatAutoResponder {
         
         window.addEventListener('message', (event) => {
             if (event.data?.type === 'omni-appeal-detected') {
-                setTimeout(() => this.checkForAppeals(), 1000);
+                setTimeout(() => this.checkForAppeals(), 300);  // Optimized from 1000ms
             }
         });
     }

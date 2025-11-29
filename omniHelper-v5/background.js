@@ -10,7 +10,7 @@ chrome.runtime.onInstalled.addListener((details) => {
             config: {
                 responseDelay: 2000,
                 clickDelay: 500,
-                checkInterval: 2000,  // Optimized from 20000ms to 2000ms
+                checkInterval: 2000,  // Check for new appeals every 2 seconds
                 cooldownPeriod: 7200000,
                 templateText: 'Запрос принят в работу',
                 templateTitle: '1.1 Приветствие'

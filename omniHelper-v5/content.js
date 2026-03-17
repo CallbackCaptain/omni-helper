@@ -4,11 +4,15 @@
 class OmniChatAutoResponder {
     constructor() {
         // Core state
-        this.processedAppeals = new Set();
+        this.processedAppeals = new Map(); // appealId → timestamp
         this.appealQueue = [];
         this.isProcessing = false;
         this.autoResponseEnabled = true;
+        this.knownAppealIds = new Map(); // name → Set of real appealIds from network
         
+        // Extra-time tracking (persisted in chrome.storage)
+        this.extraTimeSent = new Set(); // appealIds that got the extra-time template
+
         // Configuration
         this.config = {
             responseDelay: 2000,
@@ -16,7 +20,11 @@ class OmniChatAutoResponder {
             checkInterval: 2000,       // Check for new appeals every 2 seconds
             cooldownPeriod: 2 * 60 * 60 * 1000,  // 2 hours cooldown
             templateText: 'Запрос принят в работу',
-            templateTitle: '1.1 Приветствие'
+            templateTitle: '1.1 Приветствие',
+            extraTimeThreshold: 600,   // seconds on badge timer
+            extraTimeMinAge: 5 * 60 * 1000, // min 5 minutes after greeting before extra-time
+            extraTimeTemplateText: 'Ваш запрос находится в работе, но для его решения потребуется больше времени. Пожалуйста, ожидайте.',
+            extraTimeTemplateTitle: '2.3 Требуется доп. время'
         };
         
         this.init();
@@ -36,61 +44,141 @@ class OmniChatAutoResponder {
 
     // ===== STATE MANAGEMENT =====
     
+    isChromeValid() {
+        try {
+            return !!(chrome && chrome.runtime && chrome.runtime.id);
+        } catch (e) {
+            return false;
+        }
+    }
+
     loadState() {
-        chrome.storage.local.get(['processedAppeals', 'autoResponseEnabled', 'config'], (result) => {
-            if (result.autoResponseEnabled !== undefined) {
-                this.autoResponseEnabled = result.autoResponseEnabled;
-            }
-            
-            if (result.processedAppeals) {
-                const now = Date.now();
-                result.processedAppeals.forEach(item => {
-                    // Only load appeals within cooldown period
-                    if (now - item.timestamp < this.config.cooldownPeriod) {
-                        this.processedAppeals.add(item.appealId);
-                    }
-                });
-                console.log(`📥 Loaded ${this.processedAppeals.size} processed appeals`);
-            }
-            
-            if (result.config) {
-                Object.assign(this.config, result.config);
-            }
-        });
+        if (!this.isChromeValid()) return;
+        try {
+            chrome.storage.local.get(['processedAppeals', 'autoResponseEnabled', 'config', 'extraTimeSent'], (result) => {
+                if (chrome.runtime.lastError) return;
+                if (result.autoResponseEnabled !== undefined) {
+                    this.autoResponseEnabled = result.autoResponseEnabled;
+                }
+
+                if (result.processedAppeals) {
+                    const now = Date.now();
+                    result.processedAppeals.forEach(item => {
+                        if (now - item.timestamp < this.config.cooldownPeriod) {
+                            this.processedAppeals.set(item.appealId, item.timestamp);
+                        }
+                    });
+                    console.log(`📥 Loaded ${this.processedAppeals.size} processed appeals`);
+                }
+
+                if (result.extraTimeSent) {
+                    result.extraTimeSent.forEach(id => this.extraTimeSent.add(id));
+                    console.log(`📥 Loaded ${this.extraTimeSent.size} extra-time records`);
+                }
+
+                if (result.config) {
+                    Object.assign(this.config, result.config);
+                }
+            });
+        } catch (e) {
+            console.warn('⚠️ Chrome API unavailable in loadState');
+        }
     }
 
     saveProcessedAppeal(appealId) {
-        this.processedAppeals.add(appealId);
-        
-        chrome.storage.local.get(['processedAppeals'], (result) => {
-            const processed = result.processedAppeals || [];
-            
-            // Add new entry
-            processed.push({
-                appealId: appealId,
-                timestamp: Date.now()
+        this.processedAppeals.set(appealId, Date.now());
+
+        if (!this.isChromeValid()) return;
+        try {
+            chrome.storage.local.get(['processedAppeals'], (result) => {
+                if (chrome.runtime.lastError) return;
+                const processed = result.processedAppeals || [];
+
+                processed.push({
+                    appealId: appealId,
+                    timestamp: Date.now()
+                });
+
+                const now = Date.now();
+                const filtered = processed
+                    .filter(item => now - item.timestamp < this.config.cooldownPeriod)
+                    .slice(-100);
+
+                chrome.storage.local.set({ processedAppeals: filtered });
             });
-            
-            // Keep only last 100 entries within cooldown
-            const now = Date.now();
-            const filtered = processed
-                .filter(item => now - item.timestamp < this.config.cooldownPeriod)
-                .slice(-100);
-            
-            chrome.storage.local.set({ processedAppeals: filtered });
-        });
+        } catch (e) {
+            console.warn('⚠️ Chrome API unavailable in saveProcessedAppeal');
+        }
+    }
+
+    saveExtraTimeSent() {
+        if (!this.isChromeValid()) return;
+        try {
+            chrome.storage.local.set({ extraTimeSent: [...this.extraTimeSent].slice(-100) });
+        } catch (e) {}
     }
 
     // ===== APPEAL DETECTION =====
     
     checkForAppeals() {
         if (!this.autoResponseEnabled) return;
-        
+
         const appeals = this.findAppealsInSidebar();
-        
+
         appeals.forEach(appeal => {
             if (this.shouldProcess(appeal.id)) {
                 this.addToQueue(appeal);
+            } else if (appeal.isNameBased && this.processedAppeals.has(appeal.id)) {
+                // Повторное обращение от того же клиента
+                const processedAt = this.processedAppeals.get(appeal.id);
+                const elapsed = Date.now() - processedAt;
+                const timer = this.getBadgeTimer(appeal.element);
+
+                // 10+ минут с обработки И badge таймер ≤ 60 сек (свежее обращение)
+                if (elapsed > 2 * 60 * 1000 && timer !== null && timer <= 60) {
+                    const reappealId = `${appeal.id}_re_${Date.now()}`;
+                    console.log('🔄 Re-appeal detected:', appeal.name, `(timer: ${timer}s)`);
+                    this.addToQueue({ ...appeal, id: reappealId });
+                    // Prevent extra-time from also firing for this appeal
+                    this.extraTimeSent.add(appeal.id);
+                    this.saveExtraTimeSent();
+                }
+            }
+        });
+
+        // Check for extra-time notifications
+        this.checkExtraTime();
+    }
+
+    checkExtraTime() {
+        const elements = document.querySelectorAll('[data-testid="appeal-preview"]');
+        elements.forEach(element => {
+            const appealData = this.extractAppealData(element);
+            if (!appealData) return;
+            const timer = this.getBadgeTimer(element);
+            if (timer !== null && timer <= this.config.extraTimeThreshold) {
+                const processedAt = this.processedAppeals.get(appealData.id);
+                const age = processedAt ? Date.now() - processedAt : 0;
+                // Skip if a greeting/re-appeal is pending in queue for this appeal
+                const hasPendingGreeting = this.appealQueue.some(a =>
+                    a.name === appealData.name && a.type !== 'extraTime'
+                );
+                if (this.processedAppeals.has(appealData.id) && !this.extraTimeSent.has(appealData.id) && age >= this.config.extraTimeMinAge && !hasPendingGreeting) {
+                    console.log('⏰ Extra-time needed:', appealData.name, `(timer: ${timer}s)`);
+                    const extraTimeId = `${appealData.id}_extraTime`;
+                    this.appealQueue.push({
+                        ...appealData,
+                        id: extraTimeId,
+                        originalId: appealData.id,
+                        type: 'extraTime',
+                        addedAt: Date.now()
+                    });
+                    this.extraTimeSent.add(appealData.id);
+                    this.saveExtraTimeSent();
+                    if (!this.isProcessing) {
+                        this.processQueue();
+                    }
+                }
             }
         });
     }
@@ -98,31 +186,71 @@ class OmniChatAutoResponder {
     findAppealsInSidebar() {
         const appeals = [];
         const elements = document.querySelectorAll('[data-testid="appeal-preview"]');
-        
+
         elements.forEach(element => {
             const appealData = this.extractAppealData(element);
             if (appealData && this.isNewAppeal(element)) {
                 appeals.push(appealData);
             }
         });
-        
+
+        // Для name-based ID: если несколько обращений от одного клиента,
+        // добавить индекс чтобы каждое получило уникальный ID
+        const nameCount = {};
+        appeals.forEach(appeal => {
+            if (appeal.isNameBased) {
+                nameCount[appeal.id] = (nameCount[appeal.id] || 0) + 1;
+            }
+        });
+
+        const nameIndex = {};
+        appeals.forEach(appeal => {
+            if (appeal.isNameBased && nameCount[appeal.id] > 1) {
+                nameIndex[appeal.id] = (nameIndex[appeal.id] || 0) + 1;
+                appeal.id = `${appeal.id}_slot_${nameIndex[appeal.id]}`;
+            }
+        });
+
         return appeals;
     }
 
     extractAppealData(element) {
-        // Get name as ID
-        const nameEl = element.querySelector('[title], .sc-hSWyVn');
-        const name = nameEl?.textContent?.trim() || nameEl?.getAttribute('title');
-        
+        const nameEl = element.querySelector('[title], .sc-eFzpJt');
+        const name = nameEl?.getAttribute('title') || nameEl?.textContent?.trim();
+
         if (!name) return null;
-        
-        // Create stable ID from name
-        const id = name.replace(/\s+/g, '_').replace(/[^\wа-яА-Я_-]/gi, '').substring(0, 50);
-        
+
+        // Priority 1: real appealId from element attributes
+        const realId = element.getAttribute('data-id') ||
+                       element.getAttribute('data-appeal-id') ||
+                       element.closest('[data-id]')?.getAttribute('data-id');
+
+        // Priority 2: appealId from network mapping (name → appealId)
+        let networkId = null;
+        const knownIds = this.knownAppealIds.get(name);
+        if (knownIds) {
+            // Find an appealId for this name that hasn't been processed yet
+            for (const aid of knownIds) {
+                if (!this.processedAppeals.has(aid)) {
+                    networkId = aid;
+                    break;
+                }
+            }
+            // If all are processed, use the last one (won't pass shouldProcess anyway)
+            if (!networkId) {
+                networkId = [...knownIds].pop();
+            }
+        }
+
+        // Priority 3: fall back to name (stable but can collide for same-name clients)
+        const nameId = name.replace(/\s+/g, '_').replace(/[^\wа-яА-Я_-]/gi, '').substring(0, 50);
+        const id = realId || networkId || nameId;
+
         return {
             id: id,
             name: name,
-            element: element
+            element: element,
+            isNameBased: !realId && !networkId
         };
     }
 
@@ -136,6 +264,15 @@ class OmniChatAutoResponder {
         if (classList.includes('unread') || classList.includes('new')) return true;
         
         return false;
+    }
+
+    getBadgeTimer(element) {
+        const badge = element.querySelector('[data-testid="badge"]');
+        if (!badge) return null;
+        const span = badge.querySelector('span');
+        if (!span) return null;
+        const match = span.textContent.match(/(\d+)/);
+        return match ? parseInt(match[1]) : null;
     }
 
     shouldProcess(appealId) {
@@ -178,13 +315,20 @@ class OmniChatAutoResponder {
         console.log('⚙️ Processing:', appeal.id);
         
         try {
-            await this.sendGreeting(appeal);
-            this.saveProcessedAppeal(appeal.id);
-            console.log('✅ Processed:', appeal.id);
+            if (appeal.type === 'extraTime') {
+                await this.sendTemplate(appeal, this.config.extraTimeTemplateTitle, this.config.extraTimeTemplateText);
+                console.log('✅ Extra-time sent:', appeal.id);
+            } else {
+                await this.sendTemplate(appeal, this.config.templateTitle, this.config.templateText);
+                this.saveProcessedAppeal(appeal.id);
+                console.log('✅ Processed:', appeal.id);
+            }
         } catch (error) {
             console.error('❌ Failed:', appeal.id, error.message);
-            // Mark as processed anyway to prevent spam
-            this.saveProcessedAppeal(appeal.id);
+            if (appeal.type !== 'extraTime') {
+                // Mark as processed anyway to prevent spam
+                this.saveProcessedAppeal(appeal.id);
+            }
         }
         
         this.currentAppealId = null;
@@ -195,48 +339,124 @@ class OmniChatAutoResponder {
     }
 
     // ===== AUTO-RESPONSE =====
-    
-    async sendGreeting(appeal) {
+
+    async flushCurrentInput() {
+        const input = document.querySelector('textarea, [contenteditable="true"], [data-testid="message-input"]');
+        if (!input) return;
+
+        const text = (input.value || input.textContent || '').trim();
+        if (!text) return;
+
+        console.log('📤 Flushing current input before switching chat:', text.substring(0, 60));
+        await this.clickSendButton();
+        await this.wait(this.config.clickDelay);
+    }
+
+    async sendTemplate(appeal, templateTitle, templateText) {
+        // Flush any text in the current chat input before switching
+        await this.flushCurrentInput();
+
         // Step 1: Click on appeal to select it
-        if (appeal.element && document.contains(appeal.element)) {
-            appeal.element.click();
+        let el = appeal.element;
+        if (!el || !document.contains(el)) {
+            // Re-find the element if it's detached from DOM
+            const all = document.querySelectorAll('[data-testid="appeal-preview"]');
+            for (const candidate of all) {
+                const nameEl = candidate.querySelector('[title], .sc-eFzpJt');
+                const name = nameEl?.getAttribute('title') || nameEl?.textContent?.trim();
+                if (name === appeal.name) {
+                    el = candidate;
+                    break;
+                }
+            }
+        }
+        if (el && document.contains(el)) {
+            this.simulateClick(el);
             await this.wait(this.config.clickDelay);
         }
-        
-        // Step 2: Open template selector
-        const templateBtn = document.querySelector('button[data-testid="choose-templates"]');
+
+        // Safety: check if this template was already sent in this chat
+        const chatMessages = document.querySelectorAll(
+            '[data-testid="message"], .message-content, .chat-message'
+        );
+        for (const msg of chatMessages) {
+            if (msg.textContent?.includes(templateText)) {
+                console.log('⚠️ Template already present in chat, skipping:', appeal.id);
+                return;
+            }
+        }
+
+        // Step 2: Open template selector with retry
+        const templateBtn = await this.waitForElement('button[data-testid="choose-templates"]');
         if (!templateBtn) throw new Error('Template button not found');
-        
-        templateBtn.click();
-        await this.wait(800);
-        
-        // Step 3: Find and click template
-        const modal = document.querySelector('div[data-testid="modal"]');
+
+        const findModal = (parent) => parent.querySelector('div[data-testid="modal"]') ||
+            parent.querySelector('[role="dialog"]') ||
+            parent.querySelector('[class*="modal" i][class*="template" i]') ||
+            parent.querySelector('[class*="Modal"]');
+
+        // Try up to 3 times to open the modal
+        let modal = null;
+        for (let attempt = 1; attempt <= 3 && !modal; attempt++) {
+            console.log(`📋 Template button click attempt ${attempt}`);
+            this.simulateClick(templateBtn);
+            modal = await this.waitForElement(findModal, document, 3000);
+        }
         if (!modal) throw new Error('Template modal not found');
         
+        // Wait for templates to load inside modal
+        await this.waitForElement('div[data-testid="reply-template"]', modal, 5000);
         const templates = modal.querySelectorAll('div[data-testid="reply-template"]');
-        let targetTemplate = this.findTargetTemplate(templates);
-        
+        console.log(`📋 Found ${templates.length} templates in modal`);
+
+        if (templates.length === 0) {
+            // Try broader selectors
+            const allClickable = modal.querySelectorAll('[class*="template" i], [class*="Template"], li, [role="option"], [role="listitem"]');
+            console.log(`📋 Fallback: found ${allClickable.length} clickable items`);
+            allClickable.forEach((el, i) => console.log(`  [${i}]`, el.textContent?.substring(0, 60)));
+        }
+
+        let targetTemplate = this.findTargetTemplate(templates, templateTitle, templateText);
+
         if (!targetTemplate && templates.length > 0) {
             targetTemplate = templates[0];
         }
-        
+
         if (!targetTemplate) throw new Error('No templates available');
-        
-        targetTemplate.click();
-        await this.wait(800);
+
+        console.log('📋 Clicking template:', targetTemplate.textContent?.substring(0, 60));
+        // Click the inner title element for better React event propagation
+        const clickTarget = targetTemplate.querySelector('span[data-testid="reply-title"]') ||
+                           targetTemplate.querySelector('[data-testid="collapsable-text"]') ||
+                           targetTemplate;
+        this.simulateClick(clickTarget);
+        await this.wait(1000);
+
+        // If template text didn't appear, try clicking the outer container
+        const inputCheck = document.querySelector('textarea, [contenteditable="true"], [data-testid="message-input"]');
+        const inputCheckText = inputCheck?.value || inputCheck?.textContent || '';
+        if (!inputCheckText.includes(templateText)) {
+            console.log('📋 Retrying click on template container');
+            this.simulateClick(targetTemplate);
+            await this.wait(1000);
+        }
+
+        // Verify template was inserted into input
+        const input = document.querySelector('textarea, [contenteditable="true"], [data-testid="message-input"]');
+        const inputText = input?.value || input?.textContent || '';
+        console.log('📋 Input after template click:', inputText.substring(0, 60) || '(empty)');
         
         // Step 4: Send message
         await this.clickSendButton();
     }
 
-    findTargetTemplate(templates) {
+    findTargetTemplate(templates, templateTitle, templateText) {
         for (const template of templates) {
             const title = template.querySelector('span[data-testid="reply-title"]')?.textContent || '';
             const text = template.querySelector('div[data-testid="collapsable-text"]')?.textContent || '';
-            
-            if (title.includes(this.config.templateTitle) || 
-                text.includes(this.config.templateText)) {
+
+            if (title.includes(templateTitle) ||
+                text.includes(templateText)) {
                 return template;
             }
         }
@@ -254,7 +474,7 @@ class OmniChatAutoResponder {
         for (const selector of selectors) {
             const btn = document.querySelector(selector);
             if (btn && !btn.disabled) {
-                btn.click();
+                this.simulateClick(btn);
                 return;
             }
         }
@@ -308,8 +528,11 @@ class OmniChatAutoResponder {
                 const originalFetch = window.fetch;
                 window.fetch = async function(...args) {
                     const [url] = args;
-                    if (url && url.includes('appealId=')) {
-                        const match = url.match(/appealId=(\\d+)/);
+                    const urlStr = typeof url === 'string' ? url : url?.url || '';
+
+                    // Catch appealId from URL params
+                    if (urlStr.includes('appealId=')) {
+                        const match = urlStr.match(/appealId=(\\d+)/);
                         if (match) {
                             window.postMessage({
                                 type: 'omni-appeal-detected',
@@ -317,7 +540,33 @@ class OmniChatAutoResponder {
                             }, '*');
                         }
                     }
-                    return originalFetch.apply(this, args);
+
+                    // Intercept response to extract appealId + client name mapping
+                    const response = await originalFetch.apply(this, args);
+                    try {
+                        if (urlStr.includes('/appeal') || urlStr.includes('/chat')) {
+                            const clone = response.clone();
+                            clone.json().then(data => {
+                                const appeals = Array.isArray(data) ? data :
+                                                data?.data ? (Array.isArray(data.data) ? data.data : [data.data]) :
+                                                data?.result ? (Array.isArray(data.result) ? data.result : [data.result]) :
+                                                [data];
+                                appeals.forEach(item => {
+                                    const id = item?.appealId || item?.id || item?.appeal_id;
+                                    const name = item?.clientName || item?.client_name ||
+                                                 item?.customer?.name || item?.name;
+                                    if (id && name) {
+                                        window.postMessage({
+                                            type: 'omni-appeal-mapping',
+                                            appealId: String(id),
+                                            clientName: name.trim()
+                                        }, '*');
+                                    }
+                                });
+                            }).catch(() => {});
+                        }
+                    } catch(e) {}
+                    return response;
                 };
             })();
         `;
@@ -328,13 +577,51 @@ class OmniChatAutoResponder {
             if (event.data?.type === 'omni-appeal-detected') {
                 setTimeout(() => this.checkForAppeals(), 1000);
             }
+            if (event.data?.type === 'omni-appeal-mapping') {
+                const { appealId, clientName } = event.data;
+                if (!this.knownAppealIds.has(clientName)) {
+                    this.knownAppealIds.set(clientName, new Set());
+                }
+                this.knownAppealIds.get(clientName).add(appealId);
+                console.log(`🗺️ Mapping: "${clientName}" → appealId ${appealId}`);
+            }
         });
     }
 
     // ===== UTILITIES =====
-    
+
+    chromeSafeSet(data) {
+        if (!this.isChromeValid()) return;
+        try { chrome.storage.local.set(data); } catch (e) {}
+    }
+
+    chromeSafeRemove(keys) {
+        if (!this.isChromeValid()) return;
+        try { chrome.storage.local.remove(keys); } catch (e) {}
+    }
+
     wait(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async waitForElement(selector, parent = document, timeout = 5000) {
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            const el = typeof selector === 'function' ? selector(parent) : parent.querySelector(selector);
+            if (el) return el;
+            await this.wait(200);
+        }
+        return null;
+    }
+
+    simulateClick(el) {
+        const rect = el.getBoundingClientRect();
+        const opts = { bubbles: true, cancelable: true, view: window, clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 };
+        el.dispatchEvent(new PointerEvent('pointerdown', { ...opts, pointerId: 1 }));
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        el.dispatchEvent(new PointerEvent('pointerup', { ...opts, pointerId: 1 }));
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
     }
 
     // ===== PUBLIC API =====
@@ -352,20 +639,20 @@ class OmniChatAutoResponder {
             // Controls
             toggle: () => {
                 this.autoResponseEnabled = !this.autoResponseEnabled;
-                chrome.storage.local.set({ autoResponseEnabled: this.autoResponseEnabled });
+                this.chromeSafeSet({ autoResponseEnabled: this.autoResponseEnabled });
                 console.log('Auto-response:', this.autoResponseEnabled ? 'ON' : 'OFF');
                 return this.autoResponseEnabled;
             },
-            
+
             enable: () => {
                 this.autoResponseEnabled = true;
-                chrome.storage.local.set({ autoResponseEnabled: true });
+                this.chromeSafeSet({ autoResponseEnabled: true });
                 return true;
             },
-            
+
             disable: () => {
                 this.autoResponseEnabled = false;
-                chrome.storage.local.set({ autoResponseEnabled: false });
+                this.chromeSafeSet({ autoResponseEnabled: false });
                 return false;
             },
             
@@ -389,7 +676,8 @@ class OmniChatAutoResponder {
             
             clearHistory: () => {
                 this.processedAppeals.clear();
-                chrome.storage.local.remove(['processedAppeals']);
+                this.extraTimeSent.clear();
+                this.chromeSafeRemove(['processedAppeals', 'extraTimeSent']);
                 return 'History cleared';
             },
             
@@ -398,7 +686,7 @@ class OmniChatAutoResponder {
             
             setConfig: (newConfig) => {
                 Object.assign(this.config, newConfig);
-                chrome.storage.local.set({ config: this.config });
+                this.chromeSafeSet({ config: this.config });
                 return 'Config updated';
             },
             
@@ -454,88 +742,93 @@ DEBUG:
 
 // ===== MESSAGE HANDLER =====
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    const responder = window.omniResponderInstance;
-    if (!responder) {
-        sendResponse({ success: false, error: 'Not initialized' });
-        return true;
-    }
-    
-    switch (request.action) {
-        case 'getStats':
-            sendResponse({
-                success: true,
-                stats: {
-                    autoResponseEnabled: responder.autoResponseEnabled,
-                    queueLength: responder.appealQueue.length,
-                    processedAppeals: responder.processedAppeals.size,
-                    isProcessing: responder.isProcessing,
-                    currentUrl: window.location.href
-                }
-            });
-            break;
-            
-        case 'toggleAutoResponse':
-            responder.autoResponseEnabled = !responder.autoResponseEnabled;
-            chrome.storage.local.set({ autoResponseEnabled: responder.autoResponseEnabled });
-            sendResponse({ success: true, enabled: responder.autoResponseEnabled });
-            break;
-            
-        case 'checkAppeals':
-            responder.checkForAppeals();
-            sendResponse({ success: true, count: responder.appealQueue.length });
-            break;
-            
-        case 'getQueue':
-            sendResponse({
-                success: true,
-                queue: responder.appealQueue.map(a => ({
-                    appealId: a.id,
-                    timestamp: a.addedAt
-                }))
-            });
-            break;
-            
-        case 'clearQueue':
-            responder.appealQueue = [];
-            responder.isProcessing = false;
-            sendResponse({ success: true });
-            break;
-            
-        case 'clearData':
-            responder.appealQueue = [];
-            responder.processedAppeals.clear();
-            responder.isProcessing = false;
-            chrome.storage.local.remove(['processedAppeals']);
-            sendResponse({ success: true });
-            break;
-            
-        case 'processManual':
-            if (request.appealId) {
-                responder.addToQueue({ id: request.appealId, manual: true });
+try {
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        const responder = window.omniResponderInstance;
+        if (!responder) {
+            sendResponse({ success: false, error: 'Not initialized' });
+            return true;
+        }
+
+        switch (request.action) {
+            case 'getStats':
+                sendResponse({
+                    success: true,
+                    stats: {
+                        autoResponseEnabled: responder.autoResponseEnabled,
+                        queueLength: responder.appealQueue.length,
+                        processedAppeals: responder.processedAppeals.size,
+                        isProcessing: responder.isProcessing,
+                        currentUrl: window.location.href
+                    }
+                });
+                break;
+
+            case 'toggleAutoResponse':
+                responder.autoResponseEnabled = !responder.autoResponseEnabled;
+                responder.chromeSafeSet({ autoResponseEnabled: responder.autoResponseEnabled });
+                sendResponse({ success: true, enabled: responder.autoResponseEnabled });
+                break;
+
+            case 'checkAppeals':
+                responder.checkForAppeals();
+                sendResponse({ success: true, count: responder.appealQueue.length });
+                break;
+
+            case 'getQueue':
+                sendResponse({
+                    success: true,
+                    queue: responder.appealQueue.map(a => ({
+                        appealId: a.id,
+                        timestamp: a.addedAt
+                    }))
+                });
+                break;
+
+            case 'clearQueue':
+                responder.appealQueue = [];
+                responder.isProcessing = false;
                 sendResponse({ success: true });
-            } else {
-                sendResponse({ success: false, error: 'No appealId' });
-            }
-            break;
-            
-        case 'updateTemplateConfig':
-            Object.assign(responder.config, request.config);
-            chrome.storage.local.set({ config: responder.config });
-            sendResponse({ success: true });
-            break;
-            
-        case 'testAutoResponse':
-            responder.checkForAppeals();
-            sendResponse({ success: true });
-            break;
-            
-        default:
-            sendResponse({ success: false, error: 'Unknown action' });
-    }
-    
-    return true;
-});
+                break;
+
+            case 'clearData':
+                responder.appealQueue = [];
+                responder.processedAppeals.clear();
+                responder.extraTimeSent.clear();
+                responder.isProcessing = false;
+                responder.chromeSafeRemove(['processedAppeals', 'extraTimeSent']);
+                sendResponse({ success: true });
+                break;
+
+            case 'processManual':
+                if (request.appealId) {
+                    responder.addToQueue({ id: request.appealId, manual: true });
+                    sendResponse({ success: true });
+                } else {
+                    sendResponse({ success: false, error: 'No appealId' });
+                }
+                break;
+
+            case 'updateTemplateConfig':
+                Object.assign(responder.config, request.config);
+                responder.chromeSafeSet({ config: responder.config });
+                sendResponse({ success: true });
+                break;
+
+            case 'testAutoResponse':
+                responder.checkForAppeals();
+                sendResponse({ success: true });
+                break;
+
+            default:
+                sendResponse({ success: false, error: 'Unknown action' });
+        }
+
+        return true;
+    });
+} catch (e) {
+    console.warn('⚠️ Could not register message listener — extension context invalidated');
+}
 
 // ===== INITIALIZATION =====
 

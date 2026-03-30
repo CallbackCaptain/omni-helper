@@ -11,7 +11,7 @@ class OmniChatAutoResponder {
         this.knownAppealIds = new Map(); // name → Set of real appealIds from network
         
         // Extra-time tracking (persisted in chrome.storage)
-        this.extraTimeSent = new Set(); // appealIds that got the extra-time template
+        this.extraTimeSent = new Map(); // appealId → last send timestamp
 
         // Configuration
         this.config = {
@@ -21,10 +21,11 @@ class OmniChatAutoResponder {
             cooldownPeriod: 2 * 60 * 60 * 1000,  // 2 hours cooldown
             templateText: 'Запрос принят в работу',
             templateTitle: '1.1 Приветствие',
-            extraTimeThreshold: 600,   // seconds on badge timer
-            extraTimeMinAge: 5 * 60 * 1000, // min 5 minutes after greeting before extra-time
-            extraTimeTemplateText: 'Ваш запрос находится в работе, но для его решения потребуется больше времени. Пожалуйста, ожидайте.',
-            extraTimeTemplateTitle: '2.3 Требуется доп. время'
+            extraTimeThreshold: 720,   // seconds on badge timer (send when ≤12 min remain)
+            extraTimeMinAge: 3 * 60 * 1000, // min 3 minutes after greeting before extra-time
+            extraTimeTemplateText: 'Мне нужно немного времени для решения вашего запроса. Пожалуйста, оставайтесь в чате.',
+            extraTimeTemplateTitle: '2.2 Ожидание общее',
+            extraTimeRepeatInterval: 3 * 60 * 1000  // repeat every 3 min while timer < threshold
         };
         
         this.init();
@@ -72,7 +73,13 @@ class OmniChatAutoResponder {
                 }
 
                 if (result.extraTimeSent) {
-                    result.extraTimeSent.forEach(id => this.extraTimeSent.add(id));
+                    result.extraTimeSent.forEach(item => {
+                        if (typeof item === 'string') {
+                            // Legacy format (Set) — ignore, will re-send
+                        } else {
+                            this.extraTimeSent.set(item.id, item.timestamp);
+                        }
+                    });
                     console.log(`📥 Loaded ${this.extraTimeSent.size} extra-time records`);
                 }
 
@@ -114,7 +121,10 @@ class OmniChatAutoResponder {
     saveExtraTimeSent() {
         if (!this.isChromeValid()) return;
         try {
-            chrome.storage.local.set({ extraTimeSent: [...this.extraTimeSent].slice(-100) });
+            const data = [...this.extraTimeSent.entries()]
+                .map(([id, timestamp]) => ({ id, timestamp }))
+                .slice(-100);
+            chrome.storage.local.set({ extraTimeSent: data });
         } catch (e) {}
     }
 
@@ -140,7 +150,7 @@ class OmniChatAutoResponder {
                     console.log('🔄 Re-appeal detected:', appeal.name, `(timer: ${timer}s)`);
                     this.addToQueue({ ...appeal, id: reappealId });
                     // Prevent extra-time from also firing for this appeal
-                    this.extraTimeSent.add(appeal.id);
+                    this.extraTimeSent.set(appeal.id, Date.now());
                     this.saveExtraTimeSent();
                 }
             }
@@ -151,34 +161,48 @@ class OmniChatAutoResponder {
     }
 
     checkExtraTime() {
+        const now = Date.now();
         const elements = document.querySelectorAll('[data-testid="appeal-preview"]');
         elements.forEach(element => {
             const appealData = this.extractAppealData(element);
             if (!appealData) return;
             const timer = this.getBadgeTimer(element);
-            if (timer !== null && timer <= this.config.extraTimeThreshold) {
-                const processedAt = this.processedAppeals.get(appealData.id);
-                const age = processedAt ? Date.now() - processedAt : 0;
-                // Skip if a greeting/re-appeal is pending in queue for this appeal
-                const hasPendingGreeting = this.appealQueue.some(a =>
-                    a.name === appealData.name && a.type !== 'extraTime'
-                );
-                if (this.processedAppeals.has(appealData.id) && !this.extraTimeSent.has(appealData.id) && age >= this.config.extraTimeMinAge && !hasPendingGreeting) {
-                    console.log('⏰ Extra-time needed:', appealData.name, `(timer: ${timer}s)`);
-                    const extraTimeId = `${appealData.id}_extraTime`;
-                    this.appealQueue.push({
-                        ...appealData,
-                        id: extraTimeId,
-                        originalId: appealData.id,
-                        type: 'extraTime',
-                        addedAt: Date.now()
-                    });
-                    this.extraTimeSent.add(appealData.id);
-                    this.saveExtraTimeSent();
-                    if (!this.isProcessing) {
-                        this.processQueue();
-                    }
-                }
+            if (timer === null || timer > this.config.extraTimeThreshold) return;
+            if (!this.processedAppeals.has(appealData.id)) return;
+
+            const processedAt = this.processedAppeals.get(appealData.id);
+            const age = now - processedAt;
+            if (age < this.config.extraTimeMinAge) return;
+
+            // Skip if a greeting/re-appeal is pending in queue for this appeal
+            const hasPendingGreeting = this.appealQueue.some(a =>
+                a.name === appealData.name && a.type !== 'extraTime'
+            );
+            if (hasPendingGreeting) return;
+
+            // Skip if already queued for extra-time
+            const hasQueuedExtraTime = this.appealQueue.some(a =>
+                a.originalId === appealData.id && a.type === 'extraTime'
+            );
+            if (hasQueuedExtraTime) return;
+
+            // Check repeat interval — allow resending after cooldown
+            const lastSent = this.extraTimeSent.get(appealData.id);
+            if (lastSent && (now - lastSent) < this.config.extraTimeRepeatInterval) return;
+
+            console.log('⏰ Extra-time needed:', appealData.name, `(timer: ${timer}s, repeat: ${lastSent ? 'yes' : 'first'})`);
+            const extraTimeId = `${appealData.id}_extraTime_${now}`;
+            this.appealQueue.push({
+                ...appealData,
+                id: extraTimeId,
+                originalId: appealData.id,
+                type: 'extraTime',
+                addedAt: now
+            });
+            this.extraTimeSent.set(appealData.id, now);
+            this.saveExtraTimeSent();
+            if (!this.isProcessing) {
+                this.processQueue();
             }
         });
     }
@@ -513,8 +537,12 @@ class OmniChatAutoResponder {
 
     startPeriodicCheck() {
         setInterval(() => {
-            if (this.autoResponseEnabled && !this.isProcessing) {
+            if (!this.autoResponseEnabled) return;
+            if (!this.isProcessing) {
                 this.checkForAppeals();
+            } else {
+                // Extra-time checks must run even while processing queue
+                this.checkExtraTime();
             }
         }, this.config.checkInterval);
     }

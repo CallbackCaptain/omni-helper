@@ -1,0 +1,17 @@
+\babel@toc {russian}{}\relax 
+\contentsline {section}{ВВЕДЕНИЕ}{3}{Doc-Start}%
+\contentsline {section}{ЗАДАНИЕ НА ПРАКТИКУ}{4}{Doc-Start}%
+\contentsline {section}{\numberline {1}Теоретические сведения}{5}{section.1}%
+\contentsline {section}{\numberline {2}Практическое задание}{8}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Описание разработанного приложения}{8}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Главная страница}{8}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Раздел <<Материнская плата>>}{8}{subsection.2.3}%
+\contentsline {subsection}{\numberline {2.4}Раздел <<Процессор>>}{8}{subsection.2.4}%
+\contentsline {subsection}{\numberline {2.5}Раздел <<Оперативная память>>}{9}{subsection.2.5}%
+\contentsline {subsection}{\numberline {2.6}Раздел <<Накопители>>}{11}{subsection.2.6}%
+\contentsline {subsection}{\numberline {2.7}Раздел <<Блок питания>>}{12}{subsection.2.7}%
+\contentsline {subsection}{\numberline {2.8}Раздел <<Видеокарта>>}{13}{subsection.2.8}%
+\contentsline {subsection}{\numberline {2.9}Раздел <<Периферия>>}{14}{subsection.2.9}%
+\contentsline {subsection}{\numberline {2.10}Техническая реализация}{15}{subsection.2.10}%
+\contentsline {section}{ЗАКЛЮЧЕНИЕ}{17}{subsection.2.10}%
+\contentsline {section}{СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ}{18}{subsection.2.10}%
